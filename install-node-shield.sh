@@ -1,8 +1,11 @@
 #!/bin/bash
 #
-# Remnawave Node DDoS Shield Installer
-# Ubuntu 22.04/24.04 compatible, error-resilient
-# SSH open for all (Fail2Ban protects from brute force)
+# Remnawave Node DDoS Shield Installer v3
+# - XDP/eBPF attempt (kernel-level L3 protection)
+# - iptables fallback (L4/L7 protection)
+# - L3 DDoS reality warning
+# - SSH open (Fail2Ban protects)
+# - No geo-block (VPN admin friendly)
 #
 
 set +e
@@ -25,19 +28,22 @@ exec > >(tee -a "$LOG_FILE")
 exec 2>&1
 
 echo "========================================"
-echo "Node Shield Installation"
+echo "Node Shield Installation v3"
 echo "Panel IP: $PANEL_IP"
 echo "Date: $(date)"
 echo "========================================"
+echo ""
+echo -e "${YELLOW}[WARNING] L3 DDoS Reality:${NC}"
+echo "  - XDP/eBPF: Protects at kernel/driver level (best effort)"
+echo "  - iptables: Only L4/L7 (SYN/connection floods)"
+echo "  - L3 saturation: REQUIRES hosting with DDoS protection"
+echo "    (OVH Game/Armor, Hetzner, Cloudflare Spectrum)"
+echo ""
 
-# Function to run commands
 run_cmd() {
     local cmd="$1"
     local desc="$2"
-    
     echo -e "${BLUE}[*] $desc${NC}"
-    echo "[CMD] $cmd" >> "$LOG_FILE"
-    
     if eval "$cmd" >> "$LOG_FILE" 2>&1; then
         echo -e "${GREEN}[✓] $desc - OK${NC}"
         return 0
@@ -77,60 +83,102 @@ echo -e "${GREEN}[✓] Interface: $IFACE${NC}"
 show_status "STEP 1: Dependencies"
 echo ""
 
-run_cmd "apt-get update -qq" "Updating package lists"
-
-apt-get upgrade -y >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}[✓] Upgrading packages - OK${NC}" || echo -e "${YELLOW}[!] Upgrading packages - SKIPPED${NC}"
-
-# Install packages one by one
-echo -e "${BLUE}[*] Installing packages one by one...${NC}"
-
-PACKAGES="curl wget htop iftop mc net-tools ethtool fail2ban ufw logrotate cron conntrack"
-for pkg in $PACKAGES; do
-    echo -n "  - $pkg: " | tee -a "$LOG_FILE"
-    if apt-get install -y "$pkg" >> "$LOG_FILE" 2>&1; then
-        echo -e "${GREEN}OK${NC}"
-    else
-        echo -e "${YELLOW}FAILED (continuing)${NC}"
+echo -e "${BLUE}[*] Waiting for apt lock...${NC}"
+for i in {1..30}; do
+    if ! lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+        break
     fi
+    echo -n "."
+    sleep 2
 done
 
-# XDP packages (optional)
-echo -e "${BLUE}[*] Installing XDP packages (optional)...${NC}"
+if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+    kill -9 $(lsof -t /var/lib/dpkg/lock-frontend) 2>/dev/null || true
+    sleep 2
+fi
+
+rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock 2>/dev/null || true
+dpkg --configure -a 2>/dev/null || true
+
+run_cmd "apt-get update -qq" "Updating package lists"
+
+# Install packages
+PACKAGES="curl wget htop iftop mc net-tools ethtool fail2ban ufw logrotate cron conntrack iptables-persistent"
+for pkg in $PACKAGES; do
+    echo -n "  - $pkg: " | tee -a "$LOG_FILE"
+    for attempt in {1..3}; do
+        if apt-get install -y "$pkg" >> "$LOG_FILE" 2>&1; then
+            echo -e "${GREEN}OK${NC}"
+            break
+        else
+            [ $attempt -eq 3 ] && echo -e "${YELLOW}FAILED${NC}" || sleep 2
+        fi
+    done
+done
+
+# XDP packages (optional but important)
+echo ""
+echo -e "${BLUE}[*] Installing XDP/eBPF packages (L3 protection attempt)...${NC}"
 XDP_PACKAGES="linux-tools-common linux-tools-generic linux-headers-generic llvm clang libelf-dev xdp-tools libxdp1"
+XDP_AVAILABLE=true
 for pkg in $XDP_PACKAGES; do
     echo -n "  - $pkg: " | tee -a "$LOG_FILE"
     if apt-get install -y "$pkg" >> "$LOG_FILE" 2>&1; then
         echo -e "${GREEN}OK${NC}"
     else
-        echo -e "${YELLOW}FAILED${NC}"
+        echo -e "${YELLOW}SKIP${NC}"
+        XDP_AVAILABLE=false
     fi
 done
 
 # Docker
-if ! command -v docker &> /dev/null; then
-    echo -e "${BLUE}[*] Installing Docker...${NC}"
+echo ""
+echo -e "${BLUE}[*] Installing Docker...${NC}"
+for attempt in {1..3}; do
+    rm -f /var/lib/dpkg/lock-frontend 2>/dev/null || true
     if curl -fsSL https://get.docker.com | sh >> "$LOG_FILE" 2>&1; then
         echo -e "${GREEN}[✓] Docker installed${NC}"
+        break
     else
-        echo -e "${YELLOW}[!] Docker install failed - install manually${NC}"
+        if [ $attempt -eq 3 ]; then
+            echo -e "${YELLOW}[!] Docker install failed - install manually:${NC}"
+            echo "    apt install -y docker.io docker-compose"
+        else
+            sleep 5
+        fi
     fi
-else
-    echo -e "${GREEN}[✓] Docker already installed${NC}"
-fi
+done
 
-# STEP 2: Sysctl
+# STEP 2: Sysctl (kernel hardening)
 show_status "STEP 2: Kernel Hardening"
 echo ""
 
 cat > /etc/sysctl.d/99-remnanode-ddos.conf << 'EOF'
+# Network buffers
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# SYN flood protection
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 2
+
+# Connection tracking
 net.netfilter.nf_conntrack_max = 524288
 net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 15
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+
+# Security
 net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
 EOF
 
 run_cmd "sysctl --system" "Applying sysctl settings"
@@ -161,27 +209,33 @@ show_status "STEP 4: Network Optimization"
 echo ""
 
 if command -v ethtool &> /dev/null; then
-    ethtool -G $IFACE rx 4096 tx 4096 2>/dev/null || true
-    ethtool -K $IFACE gro off 2>/dev/null || true
-fi
-
-mkdir -p /etc/networkd-dispatcher/routable.d/
-cat > "/etc/networkd-dispatcher/routable.d/10-ethtool-$IFACE" << EOF
+    echo -n "  - Ring buffers: " | tee -a "$LOG_FILE"
+    ethtool -G $IFACE rx 4096 tx 4096 >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}N/A${NC}"
+    
+    echo -n "  - Disable offloading: " | tee -a "$LOG_FILE"
+    ethtool -K $IFACE gro off gso off tso off ufo off >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}N/A${NC}"
+    
+    mkdir -p /etc/networkd-dispatcher/routable.d/
+    cat > "/etc/networkd-dispatcher/routable.d/10-ethtool-$IFACE" << EOF
 #!/bin/bash
 ethtool -G $IFACE rx 4096 tx 4096 2>/dev/null || true
 ethtool -K $IFACE gro off gso off tso off ufo off 2>/dev/null || true
 EOF
-chmod +x "/etc/networkd-dispatcher/routable.d/10-ethtool-$IFACE"
-echo -e "${GREEN}[✓] Network optimization configured${NC}"
+    chmod +x "/etc/networkd-dispatcher/routable.d/10-ethtool-$IFACE"
+fi
 
-# STEP 5: XDP (optional)
-show_status "STEP 5: XDP/eBPF (optional)"
+# STEP 5: XDP/eBPF (L3 protection attempt)
+show_status "STEP 5: XDP/eBPF (L3 Kernel Protection)"
 echo ""
 
-if command -v xdp-loader &> /dev/null; then
-    xdp-loader load -m skb -s xdp_pass $IFACE 2>/dev/null && echo -e "${GREEN}[✓] XDP loaded${NC}" || echo -e "${YELLOW}[!] XDP load failed${NC}"
-    
-    cat > /etc/systemd/system/xdp-load.service << EOF
+XDP_LOADED=false
+if [ "$XDP_AVAILABLE" = true ] && command -v xdp-loader &> /dev/null; then
+    echo -n "  - Loading XDP on $IFACE: " | tee -a "$LOG_FILE"
+    if xdp-loader load -m skb -s xdp_pass $IFACE >> "$LOG_FILE" 2>&1; then
+        echo -e "${GREEN}OK${NC}"
+        XDP_LOADED=true
+        
+        cat > /etc/systemd/system/xdp-load.service << EOF
 [Unit]
 Description=XDP Load
 After=network.target
@@ -193,67 +247,104 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl enable xdp-load.service 2>/dev/null || true
+        systemctl enable xdp-load.service >> "$LOG_FILE" 2>&1 || true
+        echo -e "${GREEN}[✓] XDP loaded - L3 protection ACTIVE${NC}"
+    else
+        echo -e "${YELLOW}FAILED${NC}"
+        echo -e "${YELLOW}[!] XDP load failed - driver may not support${NC}"
+    fi
 else
-    echo -e "${YELLOW}[!] XDP not available, skipping${NC}"
+    echo -e "${YELLOW}[!] XDP packages not available${NC}"
 fi
 
-# STEP 6: Server Shield
-show_status "STEP 6: Server Shield (MAIN PROTECTION)"
+if [ "$XDP_LOADED" = false ]; then
+    echo -e "${YELLOW}[!] XDP NOT loaded - L3 saturation attacks will bypass iptables${NC}"
+    echo -e "${YELLOW}[!] Solution: Use hosting with DDoS protection (OVH, Hetzner)${NC}"
+fi
+
+# STEP 6: iptables DDoS Protection (L4/L7)
+show_status "STEP 6: iptables Protection (L4/L7 Fallback)"
 echo ""
 
-if bash <(curl -fsSL https://raw.githubusercontent.com/wrx861/server-shield/main/install.sh) >> "$LOG_FILE" 2>&1; then
-    echo -e "${GREEN}[✓] Server Shield installed${NC}"
-    
-    shield l7 backend nftables 2>/dev/null || true
-    shield l7 enable 2>/dev/null || true
-    shield l7 limits syn 50 2>/dev/null || true
-    shield l7 limits conn 100 2>/dev/null || true
-    shield l7 limits rate 1000 2>/dev/null || true
-    shield l7 vpn-ports add 443 2>/dev/null || true
-    shield l7 vpn-ports add 8443 2>/dev/null || true
-    shield l7 whitelist add $PANEL_IP 2>/dev/null || true
-    shield l7 geo allow RU 2>/dev/null || true
-    shield l7 geo deny all 2>/dev/null || true
-    shield l7 tarpit enable 2>/dev/null || true
-    shield l7 autoban enable 2>/dev/null || true
-    
-    echo -e "${GREEN}[✓] Server Shield configured (Russia only)${NC}"
-else
-    echo -e "${RED}[✗] Server Shield FAILED - install manually${NC}"
-fi
+echo -e "${BLUE}[*] Setting up iptables DDoS chains...${NC}"
 
-# STEP 7: UFW Firewall (SSH открыт, Fail2Ban защищает)
+# Create/flush chains
+iptables -N DDoS_PROTECT 2>/dev/null || iptables -F DDoS_PROTECT
+iptables -N SYN_FLOOD 2>/dev/null || iptables -F SYN_FLOOD
+iptables -N CONN_LIMIT 2>/dev/null || iptables -F CONN_LIMIT
+iptables -N PORT_SCAN 2>/dev/null || iptables -F PORT_SCAN
+iptables -N PANEL_PROTECT 2>/dev/null || iptables -F PANEL_PROTECT
+
+# SYN flood protection (rate limit new connections)
+iptables -A SYN_FLOOD -p tcp --syn -m limit --limit 50/second --limit-burst 100 -j RETURN
+iptables -A SYN_FLOOD -j LOG --log-prefix "SYN_FLOOD: " --log-level 4
+iptables -A SYN_FLOOD -j DROP
+
+# Connection limiting (max 100 per IP to VPN)
+iptables -A CONN_LIMIT -p tcp --dport 443 -m connlimit --connlimit-above 100 --connlimit-mask 32 -j DROP
+iptables -A CONN_LIMIT -j RETURN
+
+# Port scan detection
+iptables -A PORT_SCAN -p tcp --tcp-flags SYN,ACK,FIN,RST RST -m limit --limit 2/second --limit-burst 4 -j RETURN
+iptables -A PORT_SCAN -j DROP
+
+# Panel protection (rate limit outbound)
+iptables -A PANEL_PROTECT -d $PANEL_IP -p tcp --dport 8443 -m conntrack --ctstate NEW -m recent --set
+iptables -A PANEL_PROTECT -d $PANEL_IP -p tcp --dport 8443 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 20 -j DROP
+iptables -A PANEL_PROTECT -j RETURN
+
+# Main chain
+iptables -A DDoS_PROTECT -p tcp --tcp-flags SYN,ACK,FIN,RST RST -j PORT_SCAN
+iptables -A DDoS_PROTECT -p tcp --syn -j SYN_FLOOD
+iptables -A DDoS_PROTECT -p tcp --dport 443 -j CONN_LIMIT
+iptables -A DDoS_PROTECT -d $PANEL_IP -p tcp --dport 8443 -j PANEL_PROTECT
+iptables -A DDoS_PROTECT -j RETURN
+
+# Insert at top
+iptables -I INPUT -j DDoS_PROTECT
+
+echo -e "${GREEN}[✓] iptables DDoS chains created${NC}"
+
+# Outbound panel protection
+iptables -N NODE_TO_PANEL 2>/dev/null || iptables -F NODE_TO_PANEL
+iptables -A NODE_TO_PANEL -d $PANEL_IP -p tcp --dport 8443 -m connlimit --connlimit-above 5 -j DROP
+iptables -A NODE_TO_PANEL -d $PANEL_IP -p tcp --dport 8443 -m limit --limit 20/minute -j ACCEPT
+iptables -A NODE_TO_PANEL -j LOG --log-prefix "PANEL_LIMIT: " --log-level 4
+iptables -I OUTPUT -j NODE_TO_PANEL 2>/dev/null || true
+
+echo -e "${GREEN}[✓] Outbound panel protection active${NC}"
+
+# STEP 7: UFW Firewall
 show_status "STEP 7: UFW Firewall"
 echo ""
 
-ufw --force reset >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}[✓] UFW reset${NC}" || echo -e "${YELLOW}[!] UFW reset failed${NC}"
+ufw --force reset >> "$LOG_FILE" 2>&1 || true
 
-# SSH открыт для всех (Fail2Ban с bantime=24h защищает от брута)
-echo -n "  - SSH port 22: " | tee -a "$LOG_FILE"
-ufw allow 22/tcp comment 'SSH - Fail2Ban protects from brute force' >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}FAILED${NC}"
+echo -e "${BLUE}[*] Configuring UFW rules...${NC}"
 
-echo -n "  - VPN port 443: " | tee -a "$LOG_FILE"
-ufw allow 443/tcp comment 'VLESS Reality' >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}FAILED${NC}"
+# SSH open (Fail2Ban protects)
+ufw allow 22/tcp comment 'SSH - Fail2Ban brute force protection'
 
-echo -n "  - API from panel ($PANEL_IP): " | tee -a "$LOG_FILE"
-ufw allow from $PANEL_IP proto tcp to any port 8443 comment 'Remnanode API' >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}FAILED${NC}"
+# VPN port (for clients)
+ufw allow 443/tcp comment 'VLESS Reality VPN'
 
-echo -n "  - Enabling UFW: " | tee -a "$LOG_FILE"
-ufw --force enable >> "$LOG_FILE" 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}FAILED${NC}"
+# API only from panel
+ufw allow from $PANEL_IP proto tcp to any port 8443 comment 'Remnanode API - Panel only'
 
-echo ""
+# Enable
+ufw --force enable >> "$LOG_FILE" 2>&1 || true
+
 echo -e "${BLUE}=== UFW Status ===${NC}"
-ufw status verbose 2>/dev/null || echo "ufw status unavailable"
+ufw status verbose 2>/dev/null || echo "ufw not available"
 
 # STEP 8: Fail2Ban
-show_status "STEP 8: Fail2Ban"
+show_status "STEP 8: Fail2Ban (Brute Force Protection)"
 echo ""
 
 if command -v fail2ban-client &> /dev/null; then
     cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local 2>/dev/null || true
     
-    cat >> /etc/fail2ban/jail.local 2>/dev/null << 'EOF'
+    cat >> /etc/fail2ban/jail.local << 'EOF'
 
 [sshd]
 enabled = true
@@ -261,16 +352,27 @@ backend = systemd
 maxretry = 2
 findtime = 60
 bantime = 86400
+port = 22
+
+[recidive]
+enabled = true
+logpath = /var/log/fail2ban.log
+banaction = iptables-allports
+bantime = 604800
+findtime = 86400
+maxretry = 5
 EOF
     
     systemctl enable fail2ban 2>/dev/null || true
-    systemctl restart fail2ban 2>/dev/null && echo -e "${GREEN}[✓] Fail2Ban configured (bantime=24h)${NC}" || echo -e "${YELLOW}[!] Fail2Ban start failed${NC}"
+    systemctl restart fail2ban 2>/dev/null || true
+    echo -e "${GREEN}[✓] Fail2Ban configured:${NC}"
+    echo -e "${GREEN}    SSH: 2 failed attempts = 24h ban${NC}"
 else
     echo -e "${YELLOW}[!] Fail2Ban not installed${NC}"
 fi
 
-# STEP 9: Circuit Breaker
-show_status "STEP 9: Circuit Breaker (Protects Panel)"
+# STEP 9: Circuit Breaker (Panel Protection)
+show_status "STEP 9: Circuit Breaker (Panel Protection)"
 echo ""
 
 cat > /usr/local/bin/circuit-breaker.sh << EOF
@@ -283,22 +385,26 @@ USAGE=\$(( CONN_NOW * 100 / CONN_MAX ))
 LOG="/var/log/circuit-breaker.log"
 
 if [ \$USAGE -gt 85 ]; then
-    echo "\$(date): DDoS detected! Conntrack \$CONN_NOW/\$CONN_MAX (\$USAGE%). Blocking panel API 90s" >> \$LOG
-    iptables -C OUTPUT -d \$PANEL_IP -p tcp --dport 8443 -j DROP 2>/dev/null || iptables -I OUTPUT -d \$PANEL_IP -p tcp --dport 8443 -j DROP
+    echo "\$(date '+%Y-%m-%d %H:%M:%S'): DDoS detected! Conntrack \$CONN_NOW/\$CONN_MAX (\$USAGE%). Blocking panel API for 90s" >> \$LOG
+    
+    # Block outbound to panel temporarily
+    if ! iptables -C OUTPUT -d \$PANEL_IP -p tcp --dport 8443 -j DROP 2>/dev/null; then
+        iptables -I OUTPUT -d \$PANEL_IP -p tcp --dport 8443 -j DROP
+    fi
+    
     sleep 90
+    
+    # Restore
     iptables -D OUTPUT -d \$PANEL_IP -p tcp --dport 8443 -j DROP 2>/dev/null || true
-    echo "\$(date): Restored panel API" >> \$LOG
+    echo "\$(date '+%Y-%m-%d %H:%M:%S'): Restored panel API connection" >> \$LOG
 fi
 EOF
 
 chmod +x /usr/local/bin/circuit-breaker.sh
 (crontab -l 2>/dev/null | grep -v circuit-breaker; echo "*/1 * * * * /usr/local/bin/circuit-breaker.sh") | crontab -
-echo -e "${GREEN}[✓] Circuit breaker installed (runs every minute)${NC}"
 
-iptables -N NODE_TO_PANEL 2>/dev/null || true
-iptables -A NODE_TO_PANEL -d $PANEL_IP -p tcp --dport 8443 -m connlimit --connlimit-above 5 -j DROP 2>/dev/null || true
-iptables -A NODE_TO_PANEL -d $PANEL_IP -p tcp --dport 8443 -m limit --limit 20/minute -j ACCEPT 2>/dev/null || true
-iptables -I OUTPUT -j NODE_TO_PANEL 2>/dev/null || true
+echo -e "${GREEN}[✓] Circuit breaker installed${NC}"
+echo -e "${GREEN}    Checks conntrack every minute, blocks panel API if >85%${NC}"
 
 # STEP 10: Docker + Remnanode
 show_status "STEP 10: Remnanode Setup"
@@ -341,17 +447,19 @@ EOF
 0 11 * * 6 root cd /opt/remnanode && docker compose pull && docker compose down && docker compose up -d && docker image prune -f
 EOF
     chmod 644 /etc/cron.d/remnawave-update
-    echo -e "${GREEN}[✓] Remnanode config created${NC}"
+    
+    echo -e "${GREEN}[✓] Remnanode config created:${NC}"
+    echo -e "${GREEN}    /opt/remnanode/docker-compose.yml${NC}"
 else
-    echo -e "${YELLOW}[!] Docker not available${NC}"
+    echo -e "${YELLOW}[!] Docker not installed${NC}"
 fi
 
-# STEP 11: Save iptables rules
+# STEP 11: Save rules
 show_status "STEP 11: Saving Firewall Rules"
 echo ""
 
 mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4 2>/dev/null && echo -e "${GREEN}[✓] Rules saved${NC}" || echo -e "${YELLOW}[!] Save failed${NC}"
+iptables-save > /etc/iptables/rules.v4 2>/dev/null && echo -e "${GREEN}[✓] iptables rules saved${NC}" || echo -e "${YELLOW}[!] Failed to save rules${NC}"
 
 cat > /etc/systemd/system/iptables-restore.service << 'EOF'
 [Unit]
@@ -370,31 +478,54 @@ systemctl enable iptables-restore.service 2>/dev/null || true
 show_status "INSTALLATION COMPLETE!"
 echo ""
 
-echo -e "${GREEN}Node IP:${NC}        $NODE_IP"
-echo -e "${GREEN}Panel IP:${NC}       $PANEL_IP"
-echo -e "${GREEN}SSH Access:${NC}     OPEN (port 22, Fail2Ban protects)"
-echo -e "${GREEN}VPN Port:${NC}       443 (VLESS)"
-echo -e "${GREEN}API Port:${NC}       8443 (Panel: $PANEL_IP only)"
+echo -e "${GREEN}Configuration:${NC}"
+echo "  Node IP:        $NODE_IP"
+echo "  Panel IP:       $PANEL_IP"
+echo "  Interface:      $IFACE"
+echo ""
+echo -e "${GREEN}Access:${NC}"
+echo "  SSH (22):       OPEN - Fail2Ban: 2 fails = 24h ban"
+echo "  VPN (443):      OPEN - Connection limit: 100/IP"
+echo "  API (8443):     $PANEL_IP only - Rate limit: 20/min"
+echo ""
+echo -e "${YELLOW}DDoS Protection Layers:${NC}"
+
+if [ "$XDP_LOADED" = true ]; then
+    echo "  [L3] XDP/eBPF:        ${GREEN}ACTIVE${NC} (kernel-level, best)"
+else
+    echo "  [L3] XDP/eBPF:        ${YELLOW}NOT AVAILABLE${NC}"
+    echo "                        (driver support missing or packages failed)"
+fi
+
+echo "  [L4] iptables SYN:    ACTIVE (50/sec limit)"
+echo "  [L4] iptables Conn:   ACTIVE (100/IP limit)"
+echo "  [L4] Circuit Breaker: ACTIVE (panel protection)"
+echo "  [L7] UFW Firewall:    ACTIVE"
+echo "  [L7] Fail2Ban:        ACTIVE (brute force protection)"
 echo ""
 
-echo -e "${YELLOW}WHAT WAS CONFIGURED:${NC}"
-echo "  ✓ Kernel hardening (sysctl)"
-echo "  ✓ Server Shield - nftables, rate limiting, Russia geo"
-echo "  ✓ UFW - 22 (SSH), 443 (VPN), 8443 (Panel only)"
-echo "  ✓ Fail2Ban - SSH brute force protection (2 fails = 24h ban)"
-echo "  ✓ Circuit Breaker - protects panel when node DDoS'd"
+echo -e "${RED}[WARNING] For L3 saturation attacks (network flooding):${NC}"
+echo "  - iptables CANNOT protect against raw packet floods"
+echo "  - XDP helps but requires driver support (check: ip link show $IFACE | grep xdp)"
+echo "  - For 100% L3 protection use:"
+echo "      * OVH Game/Armor dedicated servers"
+echo "      * Hetzner with DDoS protection"
+echo "      * Cloudflare Spectrum (proxy VPN port)"
 echo ""
 
 echo -e "${YELLOW}NEXT STEPS:${NC}"
-echo "1. ${GREEN}reboot${NC}"
-echo "2. Edit ${BLUE}/opt/remnanode/docker-compose.yml${NC}, add SECRET_KEY"
-echo "3. Run: ${BLUE}cd /opt/remnanode && docker compose up -d${NC}"
+echo "1. ${GREEN}reboot${NC} (required for all kernel settings)"
+echo "2. Edit ${BLUE}/opt/remnanode/docker-compose.yml${NC}"
+echo "   Replace <GET_FROM_PANEL> with SECRET_KEY from Remnawave Panel"
+echo "3. Start node: ${GREEN}cd /opt/remnanode && docker compose up -d${NC}"
+echo "4. Verify in panel that node is online"
 echo ""
 
-echo -e "${YELLOW}VERIFICATION:${NC}"
-echo "  shield l7 status         - Server Shield"
-echo "  ufw status verbose       - Firewall"
-echo "  fail2ban-client status   - Fail2Ban"
-echo "  cat /var/log/circuit-breaker.log - DDoS events"
+echo -e "${YELLOW}VERIFICATION COMMANDS:${NC}"
+echo "  ip link show $IFACE | grep xdp     # Check XDP status"
+echo "  iptables -L DDoS_PROTECT -n -v   # DDoS rules"
+echo "  ufw status verbose                 # Firewall"
+echo "  fail2ban-client status             # Brute force protection"
+echo "  cat /var/log/circuit-breaker.log   # DDoS events (if any)"
 echo ""
 echo "Log: $LOG_FILE"
